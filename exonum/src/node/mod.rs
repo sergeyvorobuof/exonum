@@ -34,9 +34,11 @@ use tokio_core::reactor::Core;
 use toml::Value;
 
 use std::{
-    collections::{BTreeMap, HashSet}, fmt, io, net::SocketAddr, sync::Arc, thread,
+    collections::{BTreeMap, HashSet}, fmt, io, net::{SocketAddr, ToSocketAddrs}, sync::Arc, thread,
     time::{Duration, SystemTime},
 };
+
+use serde::de::{self, Deserialize, Deserializer};
 
 use blockchain::{
     Blockchain, GenesisConfig, Schema, Service, SharedNodeState, Transaction, ValidatorKeys,
@@ -54,6 +56,8 @@ use helpers::{
 use messages::{Connect, Message, RawMessage};
 use storage::{Database, DbOptions};
 
+
+use std::collections::HashMap;
 mod basic;
 mod connect_list;
 mod consensus;
@@ -104,6 +108,7 @@ pub trait SystemStateProvider: ::std::fmt::Debug + Send + 'static {
 pub struct ApiSender(pub mpsc::Sender<ExternalMessage>);
 
 /// Handler that that performs consensus algorithm.
+#[deny(missing_docs)]
 pub struct NodeHandler {
     /// State of the `NodeHandler`.
     pub state: State,
@@ -117,6 +122,8 @@ pub struct NodeHandler {
     pub blockchain: Blockchain,
     /// Known peer addresses.
     pub peer_discovery: Vec<SocketAddr>,
+    ///priorities
+    pub user_priority: HashMap<PublicKey, u64>,
     /// Does this node participate in the consensus?
     is_enabled: bool,
     /// Node role.
@@ -234,7 +241,8 @@ pub struct NodeConfig {
     /// Network listening address.
     pub listen_address: SocketAddr,
     /// Remote Network address used by this node.
-    pub external_address: Option<SocketAddr>,
+    #[serde(deserialize_with = "deserialize_socket_address")]
+    pub external_address: SocketAddr,
     /// Network configuration.
     pub network: NetworkConfiguration,
     /// Consensus public key.
@@ -389,6 +397,7 @@ impl NodeHandler {
         system_state: Box<dyn SystemStateProvider>,
         config: Configuration,
         api_state: SharedNodeState,
+        user_priority: HashMap<PublicKey, u64>,
         config_file_path: Option<String>,
     ) -> Self {
         let (last_hash, last_height) = {
@@ -448,6 +457,7 @@ impl NodeHandler {
             state,
             channel: sender,
             peer_discovery: config.peer_discovery,
+            user_priority,
             is_enabled,
             node_role,
             config_manager,
@@ -760,10 +770,28 @@ impl fmt::Debug for ApiSender {
     }
 }
 
+fn deserialize_socket_address<'de, D>(value: D) -> Result<SocketAddr, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let address_str: String = Deserialize::deserialize(value)?;
+    address_str
+        .to_socket_addrs()
+        .map_err(de::Error::custom)?
+        .next()
+        .ok_or_else(|| {
+            de::Error::custom(&format!(
+                "no one ip belongs to the hostname: {}",
+                address_str
+            ))
+        })
+}
+
 /// Data needed to add peer into `ConnectList`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ConnectInfo {
     /// Peer address.
+    #[serde(deserialize_with = "deserialize_socket_address")]
     pub address: SocketAddr,
     /// Peer public key.
     pub public_key: PublicKey,
@@ -879,23 +907,18 @@ impl Node {
             network: node_cfg.network,
             peer_discovery: peers,
         };
-
-        let external_address = if let Some(v) = node_cfg.external_address {
-            v
-        } else {
-            warn!("Could not find 'external_address' in the config, using 'listen_address'");
-            node_cfg.listen_address
-        };
+        let mut user_priority =  HashMap :: new();
         let api_state = SharedNodeState::new(node_cfg.api.state_update_timeout as u64);
         let system_state = Box::new(DefaultSystemState(node_cfg.listen_address));
         let network_config = config.network;
         let handler = NodeHandler::new(
             blockchain,
-            external_address,
+            node_cfg.external_address,
             channel.node_sender(),
             system_state,
             config,
             api_state,
+            user_priority,
             config_file_path,
         );
         Self {
@@ -1107,3 +1130,4 @@ mod tests {
         assert_eq!(schema.transactions_pool_len(), 1);
     }
 }
+
