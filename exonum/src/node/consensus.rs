@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use std::{collections::HashSet, error::Error};
-
+use std::cmp::Reverse;
+//extern crate transactions;
 use blockchain::{Schema, Transaction};
+use blockchain::{Blockchain, ExecutionResult, Service};
 use crypto::{CryptoHash, Hash, PublicKey};
 use events::InternalRequest;
 use helpers::{Height, Round, ValidatorId};
@@ -24,6 +26,244 @@ use messages::{
 };
 use node::{NodeHandler, RequestData};
 use storage::Patch;
+use storage::{Database, Fork, ListIndex, Snapshot};
+#[macro_export]
+macro_rules! transactions {
+    // Empty variant.
+    {} => {};
+    // Variant with the private enum.
+    {
+        $(#[$tx_set_attr:meta])*
+        $transaction_set:ident {
+            const SERVICE_ID = $service_id:expr;
+
+            $(
+                $(#[$tx_attr:meta])*
+                struct $name:ident {
+                    $($def:tt)*
+                }
+            )*
+        }
+    } => {
+        messages! {
+            const SERVICE_ID = $service_id;
+            $(
+                $(#[$tx_attr])*
+                struct $name {
+                    $($def)*
+                }
+            )*
+        }
+
+        #[derive(Clone, Debug)]
+        $(#[$tx_set_attr])*
+        enum $transaction_set {
+            $(
+                #[allow(missing_docs)]
+                $name($name),
+            )*
+        }
+
+        transactions!(@implement $transaction_set, $($name)*);
+    };
+    // Variant with the public enum without restrictions.
+    {
+        $(#[$tx_set_attr:meta])*
+        pub $transaction_set:ident {
+            const SERVICE_ID = $service_id:expr;
+
+            $(
+                $(#[$tx_attr:meta])*
+                struct $name:ident {
+                    $($def:tt)*
+                }
+            )*
+        }
+    } => {
+        messages! {
+            const SERVICE_ID = $service_id;
+            $(
+                $(#[$tx_attr])*
+                struct $name {
+                    $($def)*
+                }
+            )*
+        }
+
+        #[derive(Clone, Debug)]
+        $(#[$tx_set_attr])*
+        pub enum $transaction_set {
+            $(
+                #[allow(missing_docs)]
+                $name($name),
+            )*
+        }
+
+        transactions!(@implement $transaction_set, $($name)*);
+    };
+    // Variant with the public enum with visibility restrictions.
+    {
+        $(#[$tx_set_attr:meta])*
+        pub($($vis:tt)+) $transaction_set:ident {
+            const SERVICE_ID = $service_id:expr;
+
+            $(
+                $(#[$tx_attr:meta])*
+                struct $name:ident {
+                    $($def:tt)*
+                }
+            )*
+        }
+    } => {
+        messages! {
+            const SERVICE_ID = $service_id;
+            $(
+                $(#[$tx_attr])*
+                struct $name {
+                    $($def)*
+                }
+            )*
+        }
+
+        #[derive(Clone, Debug)]
+        $(#[$tx_set_attr])*
+        pub($($vis)+) enum $transaction_set {
+            $(
+                #[allow(missing_docs)]
+                $name($name),
+            )*
+        }
+
+        transactions!(@implement $transaction_set, $($name)*);
+    };
+    // Implementation details
+    (@implement $transaction_set:ident, $($name:ident)*) => {
+
+        impl $crate::blockchain::TransactionSet for $transaction_set {
+            fn tx_from_raw(
+                raw: $crate::messages::RawTransaction
+            ) -> ::std::result::Result<Self, $crate::encoding::Error> {
+                let message_type = raw.message_type();
+                match message_type {
+                    $(
+                    <$name as $crate::messages::ServiceMessage>::MESSAGE_ID => {
+                        let tx = $crate::messages::Message::from_raw(raw)?;
+                        Ok($transaction_set::$name(tx))
+                    }
+                    )*
+                    _ => return Err($crate::encoding::Error::IncorrectMessageType { message_type })
+                }
+            }
+        }
+
+        impl Into<Box<dyn $crate::blockchain::Transaction>> for $transaction_set {
+            fn into(self) -> Box<dyn $crate::blockchain::Transaction> {
+                match self {$(
+                    $transaction_set::$name(tx) => Box::new(tx),
+                )*}
+            }
+        }
+
+        impl<'de> $crate::encoding::serialize::reexport::Deserialize<'de> for $transaction_set {
+            fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+            where
+                D: $crate::encoding::serialize::reexport::Deserializer<'de>,
+            {
+                use $crate::encoding::serialize::json::reexport::{Value, from_value};
+                use $crate::encoding::serialize::reexport::{DeError, Deserialize};
+
+                let value = <Value as Deserialize>::deserialize(deserializer)?;
+                let message_id: Value = value.get("message_id")
+                    .ok_or(D::Error::custom("Can't get message_id from json"))?
+                    .clone();
+                let message_id: u16 = from_value(message_id)
+                    .map_err(|e| D::Error::custom(
+                        format!("Can't deserialize message_id: {}", e)
+                    ))?;
+
+                match message_id {
+                    $(
+                    <$name as $crate::messages::ServiceMessage>::MESSAGE_ID =>
+                        <$name as $crate::encoding::serialize::json::ExonumJsonDeserialize>
+                            ::deserialize(&value)
+                            .map_err(|e| D::Error::custom(
+                                format!("Can't deserialize a value: {}", e.description())
+                            ))
+                            .map($transaction_set::$name),
+                    )*
+                    _ => Err(D::Error::custom(format!("invalid message_id: {}", message_id))),
+                }
+            }
+        }
+
+        impl $crate::encoding::serialize::reexport::Serialize for $transaction_set {
+            fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+            where
+                S: $crate::encoding::serialize::reexport::Serializer,
+            {
+                use $crate::encoding::serialize::reexport::Serialize;
+
+                match self {$(
+                    &$transaction_set::$name(ref tx) => Serialize::serialize(tx, serializer),
+                )*}
+            }
+        }
+    };
+}
+
+transactions! {
+    pub WalletTransactions {
+    const SERVICE_ID = 128;
+
+    /// Transfer `amount` of the currency from one wallet to another.
+    struct Transfer {
+        from:    &PublicKey,
+        to:      &PublicKey,
+        amount:  u64,
+        seed:    u64,
+            //priority: f64, 
+        }
+    struct MailPreparation {
+        meta: &str,
+        pub_key: &PublicKey,
+        amount: u64,
+        seed: u64,
+         //   priority: f64,
+        }
+    }
+}
+
+impl Transaction for Transfer {
+    fn verify(&self) -> bool {
+        (self.from() != self.to()) && self.verify_signature(self.from())
+    }
+
+    fn execute(&self, fork: &mut Fork) -> ExecutionResult {
+        let mut schema = Schema::new(fork);
+        let from = self.from();
+        let to = self.to();
+        let hash = self.hash();
+        let amount = self.amount();
+        let freezed_balance = 0;
+        Ok(())
+    }
+
+}
+
+impl Transaction for MailPreparation {
+    fn verify(&self) -> bool {
+        self.verify_signature(self.pub_key())
+    }
+    
+    fn execute(&self, fork: &mut Fork) -> ExecutionResult {
+        let mut schema = Schema :: new(fork);
+        let pub_key = self.pub_key();
+        let amount = self.amount();
+        let hash = self.hash();
+        // freeze_wallet_balance rrealize
+        Ok(())
+    }
+}
 
 // TODO Reduce view invocations. (ECR-171)
 impl NodeHandler {
@@ -704,17 +944,116 @@ impl NodeHandler {
             if self.state.have_prevote(round) {
                 return;
             }
+
             let snapshot = self.blockchain.snapshot();
             let schema = Schema::new(&snapshot);
             let pool = schema.transactions_pool();
             let pool_len = schema.transactions_pool_len();
+            let transactions = schema.transactions();
 
             info!("LEADER: pool = {}", pool_len);
 
             let round = self.state.round();
             let max_count = ::std::cmp::min(self.txs_block_limit() as usize, pool_len);
+            let mut count = 0;
+            let mut txs = Vec :: new();
+            let mut temp_tx_hashes = Vec :: new();
 
-            let txs: Vec<Hash> = pool.iter().take(max_count).collect();
+            for tx_hash in pool.iter() {
+                println!("{:?}", tx_hash);
+                let raw_tx = transactions.get(&tx_hash).unwrap();
+                //Checking Transfer change to 0 back
+                if raw_tx.message_type() == 0 {
+                    println!("Checked in");
+                    let tx: Transfer = Message::from_raw(raw_tx.clone()).unwrap();
+                    let from = tx.from();
+                    //let mut priority = self.user_priority;
+                    //(self.txs_block_limit() * 1000) as u64;
+                    let mut priority = 100;
+                    println!("{:?}", tx);
+                        if self.user_priority.contains_key(from) {
+                            priority = self.user_priority[from];
+                            let mut number_of_participants = ((self.user_priority.len()) as u64);
+                            let mut C = (((self.txs_block_limit() as u64)/2) as u64);
+                            let mut L = 600 as u64;
+                            let mut R = 1 as u64;
+                            let mut sum = tx.amount();
+                            let mut u = sum as u64;
+                            let mut S = 10000;
+                            //let mut array_of_priorities = Vec :: new();
+                            //{
+                            //for value in self.user_priority.values(){
+                            //    array_of_priorities.push(value);
+                            //}
+                            //}
+                            //array_of_priorities.sort();
+                            //let mut last =  array_of_priorities[0].1;
+
+                            //PREVIOS VERSION with modules where N == C
+                            //let mut array_of_priorities: Vec<_> = self.user_priority.iter().collect();
+                            //array_of_priorities.sort_by_key(|x| x.1);
+                            //let mut last =  array_of_priorities[0].1;
+                            //priority = (((priority % number_of_participants)%N) + sum) % last;
+                            let mut residue = 0;
+                            let mut M = C*L*R;
+                            residue = M*u % S;
+                            priority = (M*u -residue)/S;
+
+                            //self.user_priority.insert(*from, priority);
+                        } else {
+                        //self.user_priority.insert(*from, 100);
+                            priority = 100; 
+                        }
+                        self.user_priority.insert(*from, priority);
+                    temp_tx_hashes.push((*from, tx_hash));
+                }
+                
+                if raw_tx.message_type() == 3 {
+                    println!("Issue");
+                    let tx: MailPreparation = Message :: from_raw(raw_tx.clone()).unwrap();
+                    let pub_key = tx.pub_key();
+                    let priority = (self.txs_block_limit() ) as u64;
+                    println!("{:?}",tx);
+                    if self.user_priority.contains_key(pub_key) {
+                        self.user_priority.remove(pub_key);
+                        self.user_priority.insert(*pub_key, priority);
+                    } else {
+                        self.user_priority.insert(*pub_key, priority); 
+                    }
+                    temp_tx_hashes.push((*pub_key, tx_hash));
+                }
+
+                if raw_tx.message_type() != 3 && raw_tx.message_type() != 1 {
+                    if txs.len() <= (self.txs_block_limit() / 2) as usize {
+                        txs.push(tx_hash);
+                    }
+                }
+
+            }
+            
+            let mut map = self.user_priority.clone();
+            let mut currency_user_priority: Vec<_> = map.iter().collect();
+
+            currency_user_priority.sort_by_key(|x| Reverse(x.1));
+            for user_key in currency_user_priority.iter() {
+                for public_key in temp_tx_hashes.iter() {
+                    if *user_key.0 == public_key.0 && txs.len() < self.txs_block_limit() as usize {
+                        txs.push(public_key.1);
+                        break;
+                    } 
+                }
+            }
+
+            println!("{:?}",self.user_priority);
+            println!("{:?}", txs);
+            println!("{:?}", currency_user_priority);
+            ////////////////////////////////////////
+            /*
+            if txs.len() <= self.txs_block_limit() / 2 {
+                txs.push()
+            }
+            */
+            //let txs: Vec<Hash> = pool.iter().take(max_count).collect();
             let propose = Propose::new(
                 validator_id,
                 self.state.height(),
@@ -741,6 +1080,45 @@ impl NodeHandler {
         }
     }
 
+    /*
+    /// Priorities for transactions
+    pub fn set_priority(&self, tx_hashes: &[Hash]) {
+        let schema = Schema :: new(self.blockchain.snapshot());
+        for (index, hash) in tx_hashes.iter().enumerate() {
+            println!("{:?}", schema.transactions().get(hash));
+            let raw_tx = schema.transactions().get(hash).unwrap();
+            //Checking Transfer
+            if raw_tx.message_type() == 0 {
+                println!("Checked in");
+                let tx: Transfer = Message::from_raw(raw_tx.clone()).unwrap();
+                let from = tx.from();
+                let priority = 12;
+                println!("{:?}", tx);
+                if self.user_priority.contains_key(from) {
+                    self.user_priority.remove(from);
+                    self.user_priority.insert(*from, priority);
+                } else {
+                    self.user_priority.insert(*from, priority); 
+                }
+            }
+            if raw_tx.message_type() == 3 {
+                println!("Issue");
+                let tx: MailPreparation = Message :: from_raw(raw_tx.clone()).unwrap();
+                let pub_key = tx.pub_key();
+                let priority = 10;
+                println!("{:?}",tx);
+                if self.user_priority.contains_key(pub_key) {
+                    self.user_priority.remove(pub_key);
+                    self.user_priority.insert(*pub_key, priority);
+                } else {
+                    self.user_priority.insert(*pub_key, priority); 
+                }
+
+            }
+        }
+        println!("{:?}",self.user_priority);
+    }
+    */
     /// Handles request timeout by sending the corresponding request message to a peer.
     pub fn handle_request_timeout(&mut self, data: &RequestData, peer: Option<PublicKey>) {
         trace!("HANDLE REQUEST TIMEOUT");
@@ -1027,3 +1405,4 @@ impl NodeHandler {
         }
     }
 }
+
