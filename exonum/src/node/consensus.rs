@@ -223,14 +223,6 @@ transactions! {
         seed:    u64,
             //priority: f64, 
         }
-    struct MailPreparation {
-        meta: &str,
-        pub_key: &PublicKey,
-        amount: u64,
-        seed: u64,
-         //   priority: f64,
-        }
-    }
 }
 
 impl Transaction for Transfer {
@@ -248,21 +240,6 @@ impl Transaction for Transfer {
         Ok(())
     }
 
-}
-
-impl Transaction for MailPreparation {
-    fn verify(&self) -> bool {
-        self.verify_signature(self.pub_key())
-    }
-    
-    fn execute(&self, fork: &mut Fork) -> ExecutionResult {
-        let mut schema = Schema :: new(fork);
-        let pub_key = self.pub_key();
-        let amount = self.amount();
-        let hash = self.hash();
-        // freeze_wallet_balance rrealize
-        Ok(())
-    }
 }
 
 // TODO Reduce view invocations. (ECR-171)
@@ -1008,22 +985,8 @@ impl NodeHandler {
                     temp_tx_hashes.push((*from, tx_hash));
                 }
                 
-                if raw_tx.message_type() == 3 {
-                    println!("Issue");
-                    let tx: MailPreparation = Message :: from_raw(raw_tx.clone()).unwrap();
-                    let pub_key = tx.pub_key();
-                    let priority = (self.txs_block_limit() ) as u64;
-                    println!("{:?}",tx);
-                    if self.user_priority.contains_key(pub_key) {
-                        self.user_priority.remove(pub_key);
-                        self.user_priority.insert(*pub_key, priority);
-                    } else {
-                        self.user_priority.insert(*pub_key, priority); 
-                    }
-                    temp_tx_hashes.push((*pub_key, tx_hash));
-                }
 
-                if raw_tx.message_type() != 3 && raw_tx.message_type() != 1 {
+                if raw_tx.message_type() != 1 {
                     if txs.len() <= (self.txs_block_limit() / 2) as usize {
                         txs.push(tx_hash);
                     }
@@ -1405,4 +1368,5 @@ impl NodeHandler {
         }
     }
 }
+
 
